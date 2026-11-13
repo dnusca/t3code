@@ -1,6 +1,7 @@
 import * as Migrator from "effect/sql/Migrator";
 import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/sql/SqlClient";
+import { ensureMultiRepoSchema, isMultiRepoSchemaCurrent } from "./MultiRepoSchema.ts";
 import { reconcileV2PreviewMigration } from "./reconcileV2PreviewMigration.ts";
 
 import Migration0001 from "./Migrations/001_OrchestrationEvents.ts";
@@ -88,8 +89,6 @@ import Migration0082 from "./Migrations/082_TurnItemConversationIndex.ts";
 import Migration0083 from "./Migrations/083_CommandReadIndexes.ts";
 import Migration0084 from "./Migrations/084_LastExecutedRunIndex.ts";
 import Migration0085 from "./Migrations/085_TurnItemCounts.ts";
-import Migration0086 from "./Migrations/086_ProjectionProjectsTrackedFolders.ts";
-import Migration0087 from "./Migrations/087_TaskFolders.ts";
 
 const migrationEntries = [
   [1, "OrchestrationEvents", Migration0001],
@@ -178,8 +177,6 @@ const migrationEntries = [
   [83, "CommandReadIndexes", Migration0083],
   [84, "LastExecutedRunIndex", Migration0084],
   [85, "TurnItemCounts", Migration0085],
-  [86, "ProjectionProjectsTrackedFolders", Migration0086],
-  [87, "TaskFolders", Migration0087],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
@@ -254,7 +251,11 @@ export const hasPendingMigrations = Effect.fn("hasPendingMigrations")(function* 
     FROM effect_sql_migrations
   `;
   const row = rows[0];
-  return (row?.latestId ?? 0) < latestMigrationId || (row?.previewRows ?? 0) > 0;
+  return (
+    (row?.latestId ?? 0) < latestMigrationId ||
+    (row?.previewRows ?? 0) > 0 ||
+    !(yield* isMultiRepoSchemaCurrent)
+  );
 });
 
 const run = Migrator.make({});
@@ -301,6 +302,8 @@ export const runMigrations = Effect.fn("runMigrations")(function* ({
     }
     executedMigrations.push(...(yield* run({ loader: makeMigrationLoader(id) })));
   }
+  // Outside the numbered list, so it never takes an id an upstream migration needs.
+  if (toMigrationInclusive === undefined) yield* ensureMultiRepoSchema;
   const migrations = executedMigrations.map(([id, name]) => `${id}_${name}`);
   yield* migrations.length === 0
     ? Effect.logDebug("Database schema is current")
