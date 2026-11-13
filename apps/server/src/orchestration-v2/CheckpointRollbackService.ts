@@ -37,6 +37,7 @@ import * as ProjectStore from "./ProjectStore.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import { ProviderSessionManagerV2 } from "./ProviderSessionManager.ts";
 import { RuntimePolicyAboveCeilingError, RuntimePolicyV2 } from "./RuntimePolicy.ts";
+import { RunFinalizationObserver } from "./RunFinalizationService.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 
 export const ROLLBACK_FAILED_MESSAGE =
@@ -139,6 +140,7 @@ export const layer: Layer.Layer<
     const path = yield* Path.Path;
     const taskFolders = yield* TaskFolders.TaskFolders;
     const threadCommands = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+    const finalizationObserver = yield* RunFinalizationObserver;
     const isManagedWorktreePath = yield* makeIsManagedWorktreePath;
 
     const execute = Effect.fn("orchestrationV2.checkpointRollback.execute")(function* (input: {
@@ -408,6 +410,13 @@ export const layer: Layer.Layer<
             });
       if (restoreFiles) {
         yield* checkpoints.restore({ targets: restoreTargets, scopes: [scope, ...repositories] });
+        // Collapsed repository rows read cached local status, which otherwise only a turn refreshes.
+        if (repositories.length > 0) {
+          yield* finalizationObserver.refreshRepositories({
+            threadId: input.threadId,
+            cwds: repositories.map((repository) => repository.cwd),
+          });
+        }
       }
       const staleScopeCheckpoints = staleCheckpoints.filter((stale) => stale.scopeId === scope.id);
       if (staleScopeCheckpoints.length > 0) {

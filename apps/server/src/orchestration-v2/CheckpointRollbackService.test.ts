@@ -45,6 +45,8 @@ import * as ProjectStore from "./ProjectStore.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
+import * as RunFinalizationService from "./RunFinalizationService.ts";
+import * as TaskFolders from "../workspace/TaskFolders.ts";
 import { layerNoTaskFolders } from "./ProviderTurnStartService.testkit.ts";
 
 const unrelatedProject = Option.some({
@@ -845,4 +847,116 @@ it.layer(ProjectionStore.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMe
         }),
     );
   },
+);
+
+it.effect.each([{ restoreFiles: true }, { restoreFiles: false }])(
+  "refreshes the restored repositories' status after a rewind with restoreFiles $restoreFiles",
+  ({ restoreFiles }) =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fileSystem.realPath(
+        yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-rollback-repos-" }),
+      );
+      const repositoryPath = path.join(root, "api");
+      yield* fileSystem.makeDirectory(repositoryPath);
+      const threadId = ThreadId.make("rollback-repositories");
+      const providerThreadId = ProviderThreadId.make("rollback-repositories-provider-thread");
+      const providerInstanceId = ProviderInstanceId.make("rollback-repositories-instance");
+      const checkpointId = CheckpointId.make("rollback-repositories-checkpoint");
+      const scopeId = CheckpointScopeId.make("rollback-repositories-root");
+      const repositoryScope = {
+        id: CheckpointScopeId.make("rollback-repositories-api"),
+        cwd: repositoryPath,
+        repositoryPath,
+      };
+      const projection = {
+        thread: {
+          id: threadId,
+          projectId: ProjectId.make("rollback-repositories-project"),
+          worktreePath: root,
+          branch: null,
+          activeProviderThreadId: providerThreadId,
+          modelSelection: { instanceId: providerInstanceId, model: "test-model" },
+        },
+        providerThread: {
+          id: providerThreadId,
+          providerSessionId: ProviderSessionId.make("rollback-repositories-session"),
+          providerInstanceId,
+        },
+        providerSession: undefined,
+        checkpoint: { id: checkpointId, scopeId, status: "ready", appRunOrdinal: 0 },
+        scope: { id: scopeId, cwd: root },
+        runsToRollback: [],
+        targetAttempt: undefined,
+        rolledBackAttemptIds: [],
+        staleCheckpoints: [],
+        rootNodes: [],
+        providerTurns: [],
+      } as unknown as ProjectionStore.ProjectionCheckpointRollbackContext;
+      const refreshed: Array<ReadonlyArray<string>> = [];
+      const testLayer = CheckpointRollbackService.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            ThreadCommandExecutor.layer,
+            NodeServices.layer,
+            Layer.mock(TaskFolders.TaskFolders)({
+              find: () =>
+                Effect.succeed({
+                  projectIsWorktree: true,
+                  repositories: [{ worktreePath: repositoryPath }],
+                } as never),
+            }),
+            Layer.mock(ServerConfig.ServerConfig)({
+              worktreesDir: "/synthetic-worktrees",
+            } as never),
+            ServerSettings.layerTest(),
+            Layer.mock(GitWorkflow.GitWorkflowService)({}),
+            Layer.mock(ProjectStore.ProjectStoreV2)({
+              get: () => Effect.succeed(unrelatedProject),
+            }),
+            Layer.mock(CheckpointService.CheckpointServiceV2)({
+              repositoryScopes: () => Effect.succeed([repositoryScope] as never),
+              restore: () => Effect.void,
+              discardRepositorySnapshots: () => Effect.void,
+            }),
+            Layer.mock(EventSink.EventSinkV2)({ write: () => Effect.succeed([]) }),
+            IdAllocator.layer,
+            Layer.mock(ProjectionStore.ProjectionStoreV2)({
+              getThread: () => Effect.succeed(projection.thread),
+              getCheckpointRollbackContext: () => Effect.succeed(projection),
+              getCheckpointContext: () =>
+                Effect.succeed({
+                  checkpointScopes: [],
+                  checkpoints: [
+                    {
+                      scopeId: repositoryScope.id,
+                      status: "ready",
+                      ordinalWithinScope: 0,
+                      runId: null,
+                    },
+                  ],
+                } as never),
+              getShellSnapshot: () => Effect.succeed({ threads: [], archivedThreads: [] } as never),
+            }),
+            Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+              open: () => Effect.succeed({} as never),
+            }),
+            Layer.mock(RuntimePolicy.RuntimePolicyV2)({
+              resolve: () => Effect.succeed({ cwd: root } as never),
+            }),
+            Layer.succeed(RunFinalizationService.RunFinalizationObserver, {
+              refresh: () => Effect.void,
+              refreshAfterTurn: () => Effect.void,
+              refreshRepositories: ({ cwds }) => Effect.sync(() => void refreshed.push(cwds)),
+            }),
+          ),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* CheckpointRollbackService.CheckpointRollbackServiceV2;
+        yield* service.execute({ threadId, providerThreadId, checkpointId, scopeId, restoreFiles });
+      }).pipe(Effect.provide(testLayer));
+      assert.deepEqual(refreshed, restoreFiles ? [[repositoryPath]] : []);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
